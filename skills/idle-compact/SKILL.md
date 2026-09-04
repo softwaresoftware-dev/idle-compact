@@ -16,17 +16,34 @@ Everything runs through one stdlib-only script:
 IC="${CLAUDE_PLUGIN_ROOT}/bin/claude-idle-compact"
 ```
 
-## First: is it installed?
+## First: is it running?
+
+It runs as a long-lived daemon (`watch`), registered through the **daemon
+capability** so it restarts on failure and survives a plugin update.
 
 ```bash
-systemctl --user list-timers claude-idle-compact.timer
+"$IC" daemons          # prints name / command / args / cwd to register
 ```
 
-If there is no timer, install it (checks every 5 minutes):
+Register that with an available daemon-capability tool: start it, then
+install its autostart. **Stop the daemon before installing autostart** — the
+installer runs `systemctl start` without stopping an already-running process,
+and two instances would type into the same session at once.
+
+Check it with the daemon capability's status tool, or:
 
 ```bash
-"$IC" install --interval 5
+systemctl --user status idle-compact.service
+journalctl --user -u idle-compact.service -f
 ```
+
+`ipc_reachable: false` is expected and not a fault: this daemon serves no IPC,
+it just wakes on an interval.
+
+**No daemon capability available?** `"$IC" install --interval 5` writes a
+self-contained systemd timer instead. It works, but it hardcodes the path it
+was installed from — after a plugin update that path is a stale version
+directory, so prefer the daemon capability wherever it exists.
 
 ## Answering "what's idle / why wasn't this compacted?"
 

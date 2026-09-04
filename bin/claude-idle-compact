@@ -912,6 +912,36 @@ def cmd_inspect(args):
     return 0
 
 
+def daemon_spec(interval=300):
+    """The registration a daemon-capability provider needs.
+
+    `watch` exists precisely so this plugin can run as an ordinary long-lived
+    daemon rather than needing a scheduler of its own. It holds no state
+    between passes, so being restarted costs nothing.
+    """
+    exe = Path(__file__).resolve()
+    return {"name": UNIT_NAME.replace("claude-", ""), "command": str(exe),
+            "args": ["watch", "--interval", str(interval)],
+            "cwd": str(exe.parent.parent)}
+
+
+def cmd_daemons(args):
+    spec = daemon_spec(args.interval)
+    if args.json:
+        print(json.dumps(spec, indent=2))
+        return 0
+    print("Register through the daemon capability (daemon-manager), which "
+          "restarts it on failure and\nafter a plugin update — an update moves "
+          "the plugin to a new versioned directory, so a\nself-written unit "
+          "would keep pointing at the old one:")
+    print(f"  name={spec['name']}  cmd={spec['command']}  "
+          f"args={spec['args']}  cwd={spec['cwd']}")
+    print("\nNo daemon capability available? `claude-idle-compact install` "
+          "writes a systemd timer\ninstead — self-contained, but it pins the "
+          "path it was installed from.")
+    return 0
+
+
 def cmd_config(args):
     cfg = load_config()
     for assignment in args.set or []:
@@ -1023,7 +1053,16 @@ def main():
     s.add_argument("--set", action="append", metavar="KEY=VALUE")
     s.set_defaults(func=cmd_config)
 
-    s = sub.add_parser("install", help="install the systemd user timer")
+    s = sub.add_parser("daemons",
+                       help="print the daemon-capability registration")
+    s.add_argument("--interval", type=int, default=300,
+                   help="seconds between passes (default 300)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_daemons)
+
+    s = sub.add_parser("install",
+                       help="standalone systemd timer (prefer `daemons` + the "
+                            "daemon capability)")
     s.add_argument("--interval", type=int, default=5,
                    help="minutes between checks (default 5)")
     s.set_defaults(func=cmd_install)

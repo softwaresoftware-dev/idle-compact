@@ -48,6 +48,24 @@ long-lived daemon (a systemd user timer runs `run` on an interval).
   `~/.claude/sessions/` belongs to Claude Code. `procStart` is compared
   against `/proc/<pid>/stat` field 22 to guard against pid reuse.
 
+## Scheduling
+
+Shipped path is the **daemon capability**: `watch` is a plain loop holding no
+state between passes, so it is an ordinary restartable daemon. `daemons`
+prints the registration; the consumer (a skill, or the operator) hands it to
+daemon-manager.
+
+`install` writes a standalone systemd timer and stays as the fallback for a
+checkout with no daemon capability. It resolves `__file__` at install time,
+which pins a version directory — fine from a git checkout, stale after a
+marketplace plugin update. That asymmetry is the whole reason the daemon
+capability is preferred, and it is why `install`'s help says so.
+
+Two instances must never run at once: nothing guards a session from being
+typed into twice. daemon-manager's autostart installer runs `systemctl start`
+without stopping a running process, so anything registering this daemon must
+stop it first.
+
 ## Testing
 
 `make test` for unit tests. For an end-to-end rehearsal that touches nothing

@@ -90,11 +90,26 @@ they are just not *idle*-compacted.
 /softwaresoftware:install idle-compact
 ```
 
-Then install the timer (checks every 5 minutes):
+Then run it. It is a long-lived `watch` loop, registered through the **daemon
+capability** (daemon-manager), which restarts it on failure and re-points it
+after a plugin update:
 
 ```bash
-claude-idle-compact install --interval 5
+claude-idle-compact daemons        # prints the registration to hand the daemon capability
+claude-idle-compact daemons --json
 ```
+
+Stop the daemon before installing its autostart — the installer runs
+`systemctl start` without stopping an already-running process, and two
+instances would type into the same session at once.
+
+Without a daemon capability, `claude-idle-compact install --interval 5` writes
+a standalone systemd timer. It is self-contained but hardcodes the path it was
+installed from, which after a plugin update is a stale version directory — so
+prefer the daemon capability where it exists.
+
+`ipc_reachable: false` from a daemon-capability status check is expected: this
+daemon serves no IPC, it only wakes on an interval.
 
 ## Usage
 
