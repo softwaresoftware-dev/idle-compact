@@ -215,6 +215,7 @@ class Session:
         self.session_id = entry.get("sessionId", "")
         self.cwd = entry.get("cwd", "")
         self.kind = entry.get("kind", "")
+        self.entrypoint = entry.get("entrypoint", "")
         self.status = entry.get("status", "")
         self.name = entry.get("name") or ""
         self.job_id = entry.get("jobId") or ""
@@ -338,8 +339,15 @@ def eligibility(session, cfg, now, self_id=None):
         return False, "excluded", facts
     if any(x and x in session.cwd for x in cfg["exclude_cwds"]):
         return False, "cwd excluded", facts
+    if session.entrypoint == "claude-desktop":
+        # A conversation started in the desktop app does run a real local
+        # process with a real transcript, but in Agent-SDK mode: stdin/stdout
+        # are sockets owned by the Electron app, there is no pty and no TUI,
+        # and no jobId to `claude attach`. /compact is an input-box feature,
+        # so there is simply nothing here to type into.
+        return False, "desktop app session (no TUI to type into)", facts
     if session.status != "idle":
-        return False, f"status {session.status}", facts
+        return False, f"status {session.status or 'unknown'}", facts
 
     idle = session.idle_seconds(now)
     facts["idle_seconds"] = idle
@@ -562,6 +570,10 @@ class KonsoleBackend(Backend):
 
 
 def pick_backend(session):
+    if session.entrypoint == "claude-desktop":
+        raise RuntimeError(
+            "desktop app session: runs headless via the Agent SDK (no pty, no "
+            "TUI, no job id to attach to), so there is no input to type into")
     if session.kind == "bg":
         if not session.job_id:
             raise RuntimeError("background session has no job id to attach to")

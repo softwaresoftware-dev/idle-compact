@@ -248,3 +248,39 @@ class TestTriggerLabelling:
         monkeypatch.delenv("INVOCATION_ID", raising=False)
         monkeypatch.delenv("JOURNAL_STREAM", raising=False)
         assert not ic.invoked_by_systemd()
+
+
+class TestDesktopSessions:
+    """Conversations started in the Claude desktop app register locally and
+    keep a normal transcript, but run headless via the Agent SDK — sockets for
+    stdin/stdout, no pty, no TUI, no job id. There is no input box, so no
+    backend can drive them; they must be identified and skipped explicitly
+    rather than falling through to a vague "unsupported terminal"."""
+
+    def _session(self, ic, **over):
+        entry = {"pid": 1, "sessionId": "d" * 8, "cwd": "/home/u",
+                 "kind": "interactive", "entrypoint": "claude-desktop"}
+        entry.update(over)
+        return ic.Session(entry)
+
+    def test_entrypoint_is_read(self, ic):
+        assert self._session(ic).entrypoint == "claude-desktop"
+
+    def test_pick_backend_explains_itself(self, ic):
+        import pytest as _pytest
+        with _pytest.raises(RuntimeError, match="desktop app session"):
+            ic.pick_backend(self._session(ic))
+
+    def test_skipped_before_the_status_check(self, ic, monkeypatch):
+        """Desktop entries carry no status field at all, so the desktop check
+        has to come first or the reason reads as a confusing 'status unknown'."""
+        session = self._session(ic)
+        monkeypatch.setattr(type(session), "alive", lambda self: True)
+        ok, reason, _ = ic.eligibility(session, dict(ic.DEFAULTS), 0, None)
+        assert not ok and "desktop app session" in reason
+
+    def test_missing_status_never_renders_as_none(self, ic, monkeypatch):
+        session = self._session(ic, entrypoint="cli")
+        monkeypatch.setattr(type(session), "alive", lambda self: True)
+        ok, reason, _ = ic.eligibility(session, dict(ic.DEFAULTS), 0, None)
+        assert not ok and "None" not in reason

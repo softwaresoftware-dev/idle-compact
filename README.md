@@ -63,6 +63,27 @@ messages to compact") rather than sitting out the timeout.
 after the last compaction. A compacted session that nobody has touched is left
 alone forever.
 
+## Desktop app sessions
+
+A conversation started **in the Claude desktop app** with a working directory
+does spawn a real local process and keeps a normal transcript — so this tool
+sees it, and can measure its idle time and context size. It still cannot
+compact it.
+
+The desktop app runs its sessions headless through the Agent SDK
+(`--input-format stream-json`), with stdin/stdout as sockets owned by the
+Electron process: no pty, no TUI, no input box, and no job id to
+`claude attach` to. `/compact` is a feature of the input box, so there is
+nothing to type into. These sessions are identified by
+`entrypoint: claude-desktop` and skipped with that reason rather than a vague
+terminal error.
+
+Desktop conversations started *without* a working directory don't run locally
+at all — they leave no process, transcript, or registry entry on the machine.
+
+Claude Code's own context-full auto-compact still applies to desktop sessions;
+they are just not *idle*-compacted.
+
 ## Install
 
 ```
