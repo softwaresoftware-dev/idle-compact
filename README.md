@@ -113,9 +113,9 @@ claude-idle-compact uninstall   # remove the timer
 $ claude-idle-compact status
 idle threshold 45m · context floor 50,000 tokens · kinds bg,interactive
 ID        KIND         STATUS   IDLE       CONTEXT  NAME                    WHY
-●60df6a0c interactive  idle     3d          84,120  cb-st-terms-12-r1       idle past threshold
- 0b1295f6 interactive  idle     3m               -  thatcher-97             idle 3m < 45m
- f87a7d77 interactive  busy     2s               -  thatcher-61             this session
+●60df6a0c interactive  idle     3d          84,120  api-refactor            idle past threshold
+ 0b1295f6 interactive  idle     3m         112,004  billing-bug             idle 3m < 45m
+ f87a7d77 interactive  busy     2s         204,890  this-one                this session
 ```
 
 ## Settings

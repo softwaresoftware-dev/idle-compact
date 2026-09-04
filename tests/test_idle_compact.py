@@ -26,7 +26,7 @@ IDLE = f"""\
 TITLED_RULE_IDLE = """\
 ✻ Worked for 7s · done 5:42 PM
 
-──────────────────────────────────────────────── cb-st-terms-10-r1 ─
+──────────────────────────────────────────────── api-refactor ─
 ❯ 
 ────────────────────────────────────────────────────────────────────
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
@@ -36,7 +36,7 @@ DRAFT = f"""\
 ● Sure.
 
 {RULE}
-❯ whats PE ration
+❯ what does this flag do
 {RULE}
   ⏵⏵ auto mode on (shift+tab to cycle)
 """
@@ -83,7 +83,7 @@ class TestReadPromptBox:
 
     def test_unsent_draft_is_reported(self, ic):
         text, busy = ic.read_prompt_box(DRAFT)
-        assert text == "whats PE ration" and not busy
+        assert text == "what does this flag do" and not busy
 
     def test_busy_session_flagged(self, ic):
         text, busy = ic.read_prompt_box(BUSY)
