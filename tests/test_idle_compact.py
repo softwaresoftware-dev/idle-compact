@@ -229,3 +229,22 @@ class TestRefusalDetection:
     def test_real_refusals_are_matched(self, ic):
         content = "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
         assert any(r in content.lower() for r in ic.REFUSALS)
+
+
+class TestTriggerLabelling:
+    """The timer invokes the same `run` subcommand a person does, so the audit
+    log can only tell them apart if the trigger is detected, not assumed."""
+
+    def test_systemd_environment_is_detected(self, ic, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "b1f7277902bf4d3eabac3be1ee")
+        assert ic.invoked_by_systemd()
+
+    def test_journal_stream_alone_is_enough(self, ic, monkeypatch):
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setenv("JOURNAL_STREAM", "8:12345")
+        assert ic.invoked_by_systemd()
+
+    def test_plain_shell_is_not_systemd(self, ic, monkeypatch):
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+        assert not ic.invoked_by_systemd()

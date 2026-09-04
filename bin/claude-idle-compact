@@ -833,9 +833,18 @@ def do_pass(cfg, dry_run=False, trigger="timer"):
     return done, len(capped)
 
 
+def invoked_by_systemd():
+    """systemd sets both of these for a unit it starts; a shell does not."""
+    return bool(os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"))
+
+
 def cmd_run(args):
     cfg = load_config()
-    done, tried = do_pass(cfg, dry_run=args.dry_run, trigger="manual")
+    # The timer runs this same subcommand, so the trigger has to be detected
+    # rather than assumed -- otherwise the audit log calls every pass "manual"
+    # and cannot tell an unattended compaction from one someone asked for.
+    trigger = "timer" if invoked_by_systemd() else "manual"
+    done, tried = do_pass(cfg, dry_run=args.dry_run, trigger=trigger)
     if tried:
         log(f"pass complete: {done}/{tried} "
             f"{'would be compacted' if args.dry_run else 'compacted'}")
