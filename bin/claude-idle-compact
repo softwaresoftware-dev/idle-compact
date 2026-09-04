@@ -1,0 +1,1022 @@
+#!/usr/bin/env python3
+"""Compact Claude Code sessions that have sat idle too long.
+
+Claude Code's built-in /autocompact triggers on how *full* the context is.
+This triggers on how *long* a session has sat untouched: past the threshold a
+real /compact is typed into the session, so you come back to one that has
+already tidied itself instead of one that stalls on a compaction the moment
+you type.
+
+Discovery is read-only — the live session registry Claude Code keeps at
+~/.claude/sessions/<pid>.json, plus each session's transcript.
+
+Injection is a genuine keystroke into the session's own TUI. There is no API
+for triggering compaction, so typing it is the only honest way:
+
+  background   `claude attach <id>` inside a private tmux server  (desktop app)
+  tmux         send-keys into the pane claude runs in
+  yakuake      org.kde.yakuake.runCommandInTerminal
+  konsole      org.kde.konsole.Session.runCommand
+
+Every path checks before it types (prompt box empty, session not working) and
+verifies after (a compactMetadata record lands in that session's transcript).
+The yakuake path has to *infer* which terminal hosts a given process, so it
+first sends a harmless unknown slash command and confirms it landed in the
+expected transcript — a bad guess costs one "Unknown command" line rather
+than compacting the wrong session.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+REGISTRY_DIR = HOME / ".claude" / "sessions"
+PROJECTS_DIR = HOME / ".claude" / "projects"
+CONFIG_PATH = Path(os.environ.get(
+    "IDLE_COMPACT_CONFIG", HOME / ".config" / "claude-idle-compact" / "config.json"))
+STATE_DIR = Path(os.environ.get(
+    "IDLE_COMPACT_STATE", HOME / ".local" / "state" / "claude-idle-compact"))
+TMUX_SOCKET = "claude-idle-compact"
+# A lone carriage return is a real Enter. An empty string delivers nothing.
+ENTER = "\r"
+UNIT_NAME = "claude-idle-compact"
+
+DEFAULTS = {
+    # how long a session must sit untouched before it is compacted
+    "idle_minutes": 45,
+    # don't bother compacting a session that has barely used any context
+    "min_context_tokens": 50000,
+    # session ids (or name/cwd substrings) that are never touched
+    "exclude_sessions": [],
+    "exclude_cwds": [],
+    # which session kinds to consider: "bg" (desktop app / claude --bg), "interactive"
+    "kinds": ["bg", "interactive"],
+    # cap per pass so a first run over a pile of stale sessions is spread out
+    "max_per_pass": 4,
+    # a compaction of a big session takes ~1-2 minutes
+    "compact_timeout_seconds": 420,
+    # optional focus passed to /compact, e.g. "keep the deploy steps"
+    "instructions": "",
+}
+
+VERBOSE = False
+
+
+# ------------------------------------------------------------------ plumbing
+
+def log(msg):
+    print(f"[idle-compact {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def vlog(msg):
+    if VERBOSE:
+        log(msg)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+        except (OSError, ValueError) as e:
+            log(f"warning: unreadable config {CONFIG_PATH}: {e}")
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def record(event):
+    """Append one line to the audit log."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    event = dict(event, at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    with open(STATE_DIR / "log.jsonl", "a") as fh:
+        fh.write(json.dumps(event) + "\n")
+
+
+def run(cmd, timeout=15, check=False):
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=timeout, check=check)
+
+
+# -------------------------------------------------------------- pure helpers
+
+PROMPT_RE = re.compile(r"^\s*[❯>]\s?(.*?)\s*$")
+RULE_CHARS = set("─━-")
+BOX_CHARS = set("│┃┌┐└┘├┤┬┴┼╭╮╰╯|")
+BUSY_MARKERS = ("esc to interrupt", "esc to cancel")
+
+
+def is_rule(line):
+    """A horizontal rule — the input box draws one above and below itself.
+
+    The top rule often carries the tab title ("──── my-session ──"), so a rule
+    is "mostly dashes" rather than only dashes. Box-drawing corners and
+    verticals disqualify a line outright, which is what keeps the borders of
+    tables and dialogs rendered *inside* a reply from being mistaken for the
+    input box.
+    """
+    stripped = line.strip()
+    if len(stripped) < 20 or any(c in BOX_CHARS for c in stripped):
+        return False
+    dashes = sum(1 for c in stripped if c in RULE_CHARS)
+    return dashes >= 20 and dashes / len(stripped) >= 0.6
+
+
+def read_prompt_box(screen):
+    """Pull the live input box out of a rendered TUI screen.
+
+    Returns (text, busy). text is None when there is no input box on screen at
+    all — a dialog is open, the TUI has not finished drawing, or the tab is
+    scrolled up. That is deliberately distinct from an empty box: no box means
+    we do not know what typing would land on, so callers must refuse.
+
+    The box is found by its own borders rather than by scanning for a prompt
+    marker, because rendered output frequently contains ">" inside tables and
+    quotes, and an old prompt echo sits in the scrollback of every session.
+    """
+    lines = screen.splitlines()
+    busy = any(m in screen.lower() for m in BUSY_MARKERS)
+    rules = [i for i, line in enumerate(lines) if is_rule(line)]
+    if len(rules) < 2:
+        return None, busy
+    for line in lines[rules[-2] + 1:rules[-1]]:
+        m = PROMPT_RE.match(line)
+        if m:
+            return m.group(1), busy
+    return None, busy
+
+
+def map_terminal_id(konsole_paths, terminal_ids, target_path):
+    """Konsole session paths and yakuake terminal ids are both creation-ordered
+    and one-to-one, so sorted position gives the mapping. Verified by probe
+    before anything is typed."""
+    if len(konsole_paths) != len(terminal_ids) or not konsole_paths:
+        return None
+    paths = sorted(konsole_paths, key=lambda p: int(p.rsplit("/", 1)[1]))
+    tids = sorted(terminal_ids)
+    try:
+        return tids[paths.index(target_path)]
+    except ValueError:
+        return None
+
+
+def context_tokens(usage):
+    """Live context size from an assistant record's usage block."""
+    if not usage:
+        return 0
+    return (usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0))
+
+
+def humanize(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    if seconds < 172800:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d"
+
+
+def parse_ts(value):
+    """ISO-8601 (transcript) or epoch-millis (registry) -> epoch seconds."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) / 1000.0
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+# ------------------------------------------------------------------ sessions
+
+class Session:
+    def __init__(self, entry):
+        self.raw = entry
+        self.pid = entry.get("pid")
+        self.session_id = entry.get("sessionId", "")
+        self.cwd = entry.get("cwd", "")
+        self.kind = entry.get("kind", "")
+        self.status = entry.get("status", "")
+        self.name = entry.get("name") or ""
+        self.job_id = entry.get("jobId") or ""
+        self.proc_start = str(entry.get("procStart") or "")
+        self.registry_activity = max(parse_ts(entry.get("statusUpdatedAt")),
+                                     parse_ts(entry.get("updatedAt")))
+        self._transcript = None
+
+    @property
+    def short(self):
+        return self.job_id or self.session_id[:8]
+
+    @property
+    def transcript(self):
+        if self._transcript is None:
+            hits = glob.glob(str(PROJECTS_DIR / "*" / f"{self.session_id}.jsonl"))
+            self._transcript = Path(max(hits, key=os.path.getmtime)) if hits else False
+        return self._transcript or None
+
+    def alive(self):
+        """Live process, and the same one the registry recorded (guards pid reuse)."""
+        try:
+            stat = Path(f"/proc/{self.pid}/stat").read_text()
+            cmdline = Path(f"/proc/{self.pid}/cmdline").read_bytes().decode(
+                errors="replace")
+        except OSError:
+            return False
+        if "claude" not in cmdline:
+            return False
+        if self.proc_start:
+            started = stat.rsplit(")", 1)[1].split()[19]
+            if started != self.proc_start:
+                return False
+        return True
+
+    def env(self):
+        try:
+            raw = Path(f"/proc/{self.pid}/environ").read_bytes()
+        except OSError:
+            return {}
+        out = {}
+        for entry in raw.split(b"\0"):
+            if b"=" in entry:
+                k, _, v = entry.partition(b"=")
+                out[k.decode(errors="replace")] = v.decode(errors="replace")
+        return out
+
+    def last_activity(self):
+        ts = self.registry_activity
+        if self.transcript:
+            try:
+                ts = max(ts, self.transcript.stat().st_mtime)
+            except OSError:
+                pass
+        return ts
+
+    def idle_seconds(self, now=None):
+        return (now or time.time()) - self.last_activity()
+
+    def scan_transcript(self):
+        """One pass over the transcript: context size, last compaction, and
+        whether any real turn has happened since that compaction."""
+        info = {"tokens": 0, "last_compact": 0.0, "turns_since_compact": 0,
+                "turns": 0}
+        if not self.transcript:
+            return info
+        try:
+            fh = open(self.transcript, "r", errors="replace")
+        except OSError:
+            return info
+        with fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                typ = d.get("type")
+                meta = d.get("compactMetadata")
+                if meta:
+                    info["last_compact"] = parse_ts(d.get("timestamp"))
+                    info["turns_since_compact"] = 0
+                    # Records are in order, so a later assistant turn overwrites
+                    # this. Without it a just-compacted session keeps reporting
+                    # its pre-compaction size until someone types in it again.
+                    info["tokens"] = meta.get("postTokens", info["tokens"])
+                    continue
+                if typ in ("user", "assistant"):
+                    if d.get("isMeta") or d.get("isCompactSummary"):
+                        continue
+                    info["turns"] += 1
+                    info["turns_since_compact"] += 1
+                    usage = d.get("message", {}).get("usage")
+                    if usage:
+                        info["tokens"] = context_tokens(usage)
+        return info
+
+
+def discover():
+    sessions = []
+    for path in sorted(REGISTRY_DIR.glob("*.json")):
+        try:
+            sessions.append(Session(json.loads(path.read_text())))
+        except (OSError, ValueError):
+            continue
+    return sessions
+
+
+def eligibility(session, cfg, now, self_id=None):
+    """(eligible, reason, facts). Cheapest checks first."""
+    facts = {}
+    if not session.alive():
+        return False, "process gone", facts
+    if session.session_id == self_id:
+        return False, "this session", facts
+    if session.kind not in cfg["kinds"]:
+        return False, f"kind {session.kind} not enabled", facts
+    if session.session_id in cfg["exclude_sessions"]:
+        return False, "excluded", facts
+    if any(x and x in session.cwd for x in cfg["exclude_cwds"]):
+        return False, "cwd excluded", facts
+    if session.status != "idle":
+        return False, f"status {session.status}", facts
+
+    idle = session.idle_seconds(now)
+    facts["idle_seconds"] = idle
+    if idle < cfg["idle_minutes"] * 60:
+        return False, f"idle {humanize(idle)} < {cfg['idle_minutes']}m", facts
+
+    if not session.transcript:
+        return False, "no transcript", facts
+
+    info = session.scan_transcript()
+    facts.update(info)
+    if info["last_compact"] and info["turns_since_compact"] == 0:
+        return False, "already compacted, nothing new since", facts
+    if info["tokens"] < cfg["min_context_tokens"]:
+        return False, (f"context {info['tokens']:,} < "
+                       f"{cfg['min_context_tokens']:,}"), facts
+    return True, "idle past threshold", facts
+
+
+# ------------------------------------------------------------------ backends
+
+def qdbus_bin():
+    for cand in ("qdbus6", "qdbus-qt6", "qdbus-qt5", "qdbus"):
+        if shutil.which(cand):
+            return cand
+    return None
+
+
+def dbus(service, path, method, *args):
+    q = qdbus_bin()
+    if not q:
+        raise RuntimeError("no qdbus binary available")
+    r = run([q, service, path, method, *[str(a) for a in args]])
+    if r.returncode:
+        raise RuntimeError(f"{method} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.rstrip("\n")
+
+
+def dbus_owner(name):
+    try:
+        return dbus("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus.GetNameOwner", name)
+    except RuntimeError:
+        return None
+
+
+class Backend:
+    name = "?"
+    needs_probe = False
+
+    def open(self):
+        return True
+
+    def close(self):
+        pass
+
+    def screen(self):
+        raise NotImplementedError
+
+    def send_line(self, text):
+        raise NotImplementedError
+
+    def wait_for_prompt(self, timeout=45):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                text, _ = read_prompt_box(self.screen())
+            except Exception:
+                text = None
+            if text is not None:
+                return True
+            time.sleep(1.0)
+        return False
+
+
+class BgAttachBackend(Backend):
+    """Desktop-app and `claude --bg` sessions: attach a throwaway client on a
+    private tmux server, type, then tear the client down. The session itself
+    lives in the Claude Code daemon and is untouched by the teardown."""
+    name = "attach"
+
+    def __init__(self, job_id):
+        self.job_id = job_id
+        self.tmux_session = f"ic-{job_id}"
+
+    def _tmux(self, *args, timeout=15):
+        return run(["tmux", "-L", TMUX_SOCKET, *args], timeout=timeout)
+
+    def open(self):
+        if not shutil.which("tmux"):
+            raise RuntimeError("tmux is required to drive background sessions")
+        self._tmux("kill-session", "-t", self.tmux_session)
+        r = self._tmux("new-session", "-d", "-s", self.tmux_session,
+                       "-x", "200", "-y", "50",
+                       f"claude attach {self.job_id}")
+        if r.returncode:
+            raise RuntimeError(f"tmux attach failed: {r.stderr.strip()}")
+        if not self.wait_for_prompt():
+            raise RuntimeError("attached client never drew a prompt box")
+        return True
+
+    def close(self):
+        self._tmux("kill-session", "-t", self.tmux_session)
+
+    def screen(self):
+        r = self._tmux("capture-pane", "-t", self.tmux_session, "-p")
+        return r.stdout if r.returncode == 0 else ""
+
+    def send_line(self, text):
+        self._tmux("send-keys", "-t", self.tmux_session, "-l", text)
+        time.sleep(0.5)
+        self._tmux("send-keys", "-t", self.tmux_session, "Enter")
+
+
+class TmuxPaneBackend(Backend):
+    """claude running inside the user's own tmux. The pane comes from the
+    process environment, so it is exact — no probe needed."""
+    name = "tmux"
+
+    def __init__(self, tmux_env, pane):
+        self.socket = tmux_env.split(",")[0]
+        self.pane = pane
+
+    def _tmux(self, *args):
+        return run(["tmux", "-S", self.socket, *args])
+
+    def screen(self):
+        r = self._tmux("capture-pane", "-t", self.pane, "-p")
+        return r.stdout if r.returncode == 0 else ""
+
+    def send_line(self, text):
+        self._tmux("send-keys", "-t", self.pane, "-l", text)
+        time.sleep(0.5)
+        self._tmux("send-keys", "-t", self.pane, "Enter")
+
+
+class YakuakeBackend(Backend):
+    """Yakuake tab. Reading the screen is addressed by Konsole session path
+    (exact, straight out of the process environment); typing is addressed by
+    yakuake terminal id, which has to be inferred — hence the probe."""
+    name = "yakuake"
+    needs_probe = True
+
+    def __init__(self, konsole_path):
+        self.service = "org.kde.yakuake"
+        self.konsole_path = konsole_path
+        self.tid = None
+
+    def open(self):
+        paths = self._konsole_paths()
+        tids = self._terminal_ids()
+        self.tid = map_terminal_id(paths, tids, self.konsole_path)
+        if self.tid is None:
+            raise RuntimeError(
+                f"cannot map {self.konsole_path} to a yakuake terminal "
+                f"({len(paths)} konsole sessions vs {len(tids)} terminals)")
+        vlog(f"yakuake: {self.konsole_path} -> terminal {self.tid}")
+        return True
+
+    def _konsole_paths(self):
+        r = run(["busctl", "--user", "tree", self.service])
+        found = set()
+        for line in r.stdout.splitlines():
+            token = line.strip().split()[-1].lstrip("└├─│ ")
+            if token.startswith("/Sessions/"):
+                found.add(token)
+        return sorted(found, key=lambda p: int(p.rsplit("/", 1)[1]))
+
+    def _terminal_ids(self):
+        sids = dbus(self.service, "/yakuake/sessions",
+                    "org.kde.yakuake.sessionIdList")
+        tids = []
+        for s in sids.split(","):
+            if s.strip():
+                t = dbus(self.service, "/yakuake/sessions",
+                         "org.kde.yakuake.terminalIdsForSessionId", s.strip())
+                tids += [int(x) for x in t.split(",") if x.strip()]
+        return sorted(tids)
+
+    def screen(self):
+        return dbus(self.service, self.konsole_path,
+                    "org.kde.konsole.Session.getAllDisplayedText")
+
+    def send_line(self, text):
+        # Two calls, deliberately. runCommandInTerminal writes the text and its
+        # terminator in one burst, which Claude Code's TUI reads as a *paste*:
+        # the newline is inserted into the prompt box instead of submitting,
+        # and the text just stacks up unsent. A terminator arriving on its own
+        # is a real Enter. This is the same text-then-Enter split the tmux
+        # backend gets for free from send-keys.
+        dbus(self.service, "/yakuake/sessions",
+             "org.kde.yakuake.runCommandInTerminal", self.tid, text)
+        time.sleep(0.5)
+        dbus(self.service, "/yakuake/sessions",
+             "org.kde.yakuake.runCommandInTerminal", self.tid, ENTER)
+
+
+class KonsoleBackend(Backend):
+    """Plain Konsole. Both reading and typing are addressed by the same session
+    path from the environment, so there is nothing to infer.
+    Typing needs [General] EnableSecuritySensitiveDBusAPI=true in konsolerc."""
+    name = "konsole"
+
+    def __init__(self, service, konsole_path):
+        self.service = service
+        self.konsole_path = konsole_path
+
+    def screen(self):
+        return dbus(self.service, self.konsole_path,
+                    "org.kde.konsole.Session.getAllDisplayedText")
+
+    def send_line(self, text):
+        # Split for the same reason as the yakuake backend: a lone terminator
+        # submits, one bundled with the text is treated as a paste.
+        dbus(self.service, self.konsole_path,
+             "org.kde.konsole.Session.runCommand", text)
+        time.sleep(0.5)
+        dbus(self.service, self.konsole_path,
+             "org.kde.konsole.Session.runCommand", ENTER)
+
+
+def pick_backend(session):
+    if session.kind == "bg":
+        if not session.job_id:
+            raise RuntimeError("background session has no job id to attach to")
+        return BgAttachBackend(session.job_id)
+    env = session.env()
+    if env.get("TMUX") and env.get("TMUX_PANE"):
+        return TmuxPaneBackend(env["TMUX"], env["TMUX_PANE"])
+    service = env.get("KONSOLE_DBUS_SERVICE")
+    path = env.get("KONSOLE_DBUS_SESSION")
+    if service and path:
+        if dbus_owner("org.kde.yakuake") == service:
+            return YakuakeBackend(path)
+        return KonsoleBackend(service, path)
+    raise RuntimeError("unsupported terminal (need tmux, yakuake, or konsole)")
+
+
+# ------------------------------------------------------------------ compaction
+
+def transcript_len(session):
+    try:
+        return session.transcript.stat().st_size
+    except (OSError, AttributeError):
+        return 0
+
+
+def find_marker(session, needle, since_size):
+    """Look for a string in transcript content written after since_size."""
+    if not session.transcript:
+        return False
+    try:
+        with open(session.transcript, "r", errors="replace") as fh:
+            fh.seek(max(0, since_size - 4096))
+            return needle in fh.read()
+    except OSError:
+        return False
+
+
+# Deliberately does NOT include "unknown command": the probe generates one of
+# those on purpose moments earlier, and matching it would report the probe as
+# the reason the compaction failed.
+REFUSALS = ("not enough messages to compact", "nothing to compact",
+            "conversation is too short")
+
+
+def await_compaction(session, started_at, timeout):
+    """Wait for the outcome of a /compact we just typed.
+
+    Returns (meta, refusal). Claude Code declines a pointless compaction with
+    a plain local_command record rather than an error, so watching only for
+    success would sit here until the timeout every time — the refusal is the
+    common case for a session that is already compact.
+    """
+    if not session.transcript:
+        return None, None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(session.transcript, "r", errors="replace") as fh:
+                for line in fh:
+                    if "compactMetadata" not in line and "compact" not in line.lower():
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if parse_ts(d.get("timestamp")) < started_at - 2:
+                        continue
+                    meta = d.get("compactMetadata")
+                    if meta:
+                        return meta, None
+                    if d.get("type") == "system":
+                        content = str(d.get("content", "")).lower()
+                        for marker in REFUSALS:
+                            if marker in content:
+                                return None, marker
+        except OSError:
+            pass
+        time.sleep(3)
+    return None, None
+
+
+def probe_backend(session, backend):
+    """Prove keystrokes reach *this* session before typing anything that
+    matters. An unknown slash command is handled entirely client-side: it
+    writes one informational line to the transcript and never reaches the
+    model, so a wrong guess is a harmless line in someone else's session."""
+    nonce = uuid.uuid4().hex[:12]
+    size = transcript_len(session)
+    backend.send_line(f"/idle-compact-probe-{nonce}")
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if find_marker(session, nonce, size):
+            vlog(f"probe {nonce} confirmed in {session.short}")
+            return True
+        time.sleep(1)
+    return False
+
+
+def compact(session, cfg, dry_run=False):
+    """Drive one session through a compaction. Returns (ok, detail)."""
+    label = f"{session.short} ({session.name[:40] or session.cwd})"
+    if dry_run:
+        log(f"DRY RUN would compact {label}")
+        return True, "dry run"
+
+    if not session.transcript:
+        # --force skips eligibility, but every check that makes typing safe --
+        # the probe and the outcome -- is verified through the transcript.
+        return False, "no transcript yet — nothing to verify against"
+
+    try:
+        backend = pick_backend(session)
+    except RuntimeError as e:
+        return False, str(e)
+
+    opened = False
+    try:
+        backend.open()
+        opened = True
+
+        text, busy = read_prompt_box(backend.screen())
+        if text is None:
+            return False, "no prompt box on screen"
+        if busy:
+            return False, "session is working"
+        if text:
+            return False, f"unsent draft in the prompt box ({text[:40]!r})"
+
+        if backend.needs_probe and not probe_backend(session, backend):
+            return False, "probe did not land — refusing to type blind"
+
+        started = time.time()
+        command = "/compact"
+        if cfg.get("instructions"):
+            command += " " + cfg["instructions"]
+        log(f"compacting {label} via {backend.name}")
+        backend.send_line(command)
+
+        meta, refusal = await_compaction(session, started,
+                                         cfg["compact_timeout_seconds"])
+        if refusal:
+            return False, f"Claude Code declined: {refusal}"
+        if not meta:
+            return False, "no compaction recorded before timeout"
+        pre, post = meta.get("preTokens", 0), meta.get("postTokens", 0)
+        return True, f"{pre:,} -> {post:,} tokens"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        if opened:
+            try:
+                backend.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_status(args):
+    cfg = load_config()
+    now = time.time()
+    self_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    rows = []
+    for s in discover():
+        ok, reason, facts = eligibility(s, cfg, now, self_id)
+        if "tokens" not in facts and s.alive():
+            # eligibility stops at the first failed check, so a session skipped
+            # for being too fresh never gets measured. status is read on demand
+            # and is meant to be informative, so fill the column in anyway.
+            facts.update(s.scan_transcript())
+        rows.append({
+            "id": s.short, "session_id": s.session_id, "kind": s.kind,
+            "status": s.status, "name": s.name[:38], "cwd": s.cwd,
+            "idle": humanize(s.idle_seconds(now)) if s.alive() else "-",
+            "tokens": facts.get("tokens", 0),
+            "eligible": ok, "reason": reason,
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    rows.sort(key=lambda r: (not r["eligible"], r["id"]))
+    print(f"idle threshold {cfg['idle_minutes']}m · context floor "
+          f"{cfg['min_context_tokens']:,} tokens · kinds {','.join(cfg['kinds'])}")
+    print(f"{'ID':<10}{'KIND':<13}{'STATUS':<9}{'IDLE':<8}{'CONTEXT':>10}  "
+          f"{'NAME':<34} WHY")
+    for r in rows:
+        flag = "●" if r["eligible"] else " "
+        tok = f"{r['tokens']:,}" if r["tokens"] else "-"
+        print(f"{flag}{r['id']:<9}{r['kind']:<13}{r['status']:<9}{r['idle']:<8}"
+              f"{tok:>10}  {r['name']:<34} {r['reason']}")
+    eligible = sum(1 for r in rows if r["eligible"])
+    print(f"\n{eligible} of {len(rows)} session(s) eligible now")
+    return 0
+
+
+def select(sessions, selector):
+    hits = [s for s in sessions
+            if selector in (s.job_id, s.session_id)
+            or s.session_id.startswith(selector)
+            or str(s.pid) == selector
+            or (selector.lower() in s.name.lower() and selector)]
+    return hits
+
+
+def cmd_compact(args):
+    cfg = load_config()
+    hits = select(discover(), args.selector)
+    if not hits:
+        log(f"no session matches {args.selector!r}")
+        return 1
+    if len(hits) > 1:
+        log(f"{args.selector!r} matches {len(hits)}: "
+            + ", ".join(f"{h.short}({h.name[:20]})" for h in hits))
+        return 1
+    session = hits[0]
+    if not args.force:
+        ok, reason, _ = eligibility(session, cfg, time.time(),
+                                    os.environ.get("CLAUDE_CODE_SESSION_ID"))
+        if not ok:
+            log(f"{session.short} not eligible: {reason} (use --force)")
+            return 1
+    if args.dry_run:
+        log(f"would compact {session.short} via "
+            f"{pick_backend(session).name}")
+        return 0
+    ok, detail = compact(session, cfg)
+    log(f"{'compacted' if ok else 'FAILED'} {session.short}: {detail}")
+    record({"event": "compact", "session": session.session_id,
+            "short": session.short, "ok": ok, "detail": detail,
+            "trigger": "manual"})
+    return 0 if ok else 1
+
+
+def do_pass(cfg, dry_run=False, trigger="timer"):
+    now = time.time()
+    self_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    candidates = []
+    for s in discover():
+        ok, reason, facts = eligibility(s, cfg, now, self_id)
+        if ok:
+            candidates.append((s, facts))
+        else:
+            vlog(f"skip {s.short}: {reason}")
+    if not candidates:
+        vlog("nothing eligible")
+        return 0, 0
+    # oldest idle first, so the most stale sessions win a capped pass
+    candidates.sort(key=lambda c: -c[1].get("idle_seconds", 0))
+    capped = candidates[:max(1, cfg["max_per_pass"])]
+    if len(candidates) > len(capped):
+        log(f"{len(candidates)} eligible, taking {len(capped)} this pass")
+    done = 0
+    for session, facts in capped:
+        if dry_run:
+            log(f"would compact {session.short} "
+                f"({session.name[:40] or session.cwd}) — idle "
+                f"{humanize(facts.get('idle_seconds', 0))}, "
+                f"{facts.get('tokens', 0):,} tokens")
+            done += 1
+            continue
+        ok, detail = compact(session, cfg)
+        log(f"{'compacted' if ok else 'FAILED'} {session.short}: {detail}")
+        record({"event": "compact", "session": session.session_id,
+                "short": session.short, "kind": session.kind, "ok": ok,
+                "detail": detail, "trigger": trigger,
+                "idle_seconds": int(facts.get("idle_seconds", 0)),
+                "context_tokens": facts.get("tokens", 0)})
+        done += ok
+    return done, len(capped)
+
+
+def cmd_run(args):
+    cfg = load_config()
+    done, tried = do_pass(cfg, dry_run=args.dry_run, trigger="manual")
+    if tried:
+        log(f"pass complete: {done}/{tried} "
+            f"{'would be compacted' if args.dry_run else 'compacted'}")
+    return 0
+
+
+def cmd_watch(args):
+    cfg = load_config()
+    log(f"watching every {args.interval}s "
+        f"(idle {cfg['idle_minutes']}m, floor {cfg['min_context_tokens']:,})")
+    while True:
+        try:
+            do_pass(load_config(), trigger="watch")
+        except Exception as e:
+            log(f"pass error: {type(e).__name__}: {e}")
+        time.sleep(args.interval)
+
+
+def cmd_inspect(args):
+    """Read-only: what the injector would see. Never types anything."""
+    cfg = load_config()
+    hits = select(discover(), args.selector) if args.selector else [
+        s for s in discover() if s.alive()]
+    if not hits:
+        log("no session matches")
+        return 1
+    for s in hits:
+        ok, reason, _ = eligibility(s, cfg, time.time(),
+                                    os.environ.get("CLAUDE_CODE_SESSION_ID"))
+        try:
+            backend = pick_backend(s)
+            if isinstance(backend, BgAttachBackend) and not args.attach:
+                detail = "attach (pass --attach to open a client and look)"
+            else:
+                backend.open()
+                try:
+                    text, busy = read_prompt_box(backend.screen())
+                finally:
+                    backend.close()
+                if text is None:
+                    detail = "no input box visible (dialog open or scrolled up)"
+                elif busy:
+                    detail = "working"
+                elif text:
+                    detail = f"unsent draft: {text[:50]!r}"
+                else:
+                    detail = "ready — box empty"
+            name = backend.name
+        except Exception as e:
+            name, detail = "-", f"{type(e).__name__}: {e}"
+        print(f"{s.short:10} {s.kind:12} {name:8} "
+              f"{'eligible' if ok else reason:<38} {detail}")
+    return 0
+
+
+def cmd_config(args):
+    cfg = load_config()
+    for assignment in args.set or []:
+        key, _, value = assignment.partition("=")
+        if key not in DEFAULTS:
+            log(f"unknown key {key!r}; known: {', '.join(sorted(DEFAULTS))}")
+            return 1
+        default = DEFAULTS[key]
+        if isinstance(default, bool):
+            cfg[key] = value.lower() in ("1", "true", "yes", "on")
+        elif isinstance(default, int):
+            cfg[key] = int(value)
+        elif isinstance(default, list):
+            cfg[key] = [v for v in value.split(",") if v]
+        else:
+            cfg[key] = value
+    if args.set:
+        save_config(cfg)
+        log(f"wrote {CONFIG_PATH}")
+    print(json.dumps(cfg, indent=2))
+    return 0
+
+
+SERVICE_UNIT = """[Unit]
+Description=Compact idle Claude Code sessions
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart={exe} run
+"""
+
+TIMER_UNIT = """[Unit]
+Description=Check for idle Claude Code sessions to compact
+
+[Timer]
+OnBootSec=5min
+# Inactive, not Active: a pass compacts sessions one at a time and can run for
+# several minutes, so the gap has to start when the pass *finishes* or the
+# timer re-triggers the moment a long pass ends.
+OnUnitInactiveSec={interval}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def cmd_install(args):
+    exe = str(Path(__file__).resolve())
+    unit_dir = HOME / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / f"{UNIT_NAME}.service").write_text(SERVICE_UNIT.format(exe=exe))
+    (unit_dir / f"{UNIT_NAME}.timer").write_text(
+        TIMER_UNIT.format(interval=args.interval))
+    run(["systemctl", "--user", "daemon-reload"])
+    r = run(["systemctl", "--user", "enable", "--now", f"{UNIT_NAME}.timer"])
+    if r.returncode:
+        log(f"enable failed: {r.stderr.strip()}")
+        return 1
+    log(f"installed {UNIT_NAME}.timer (every {args.interval}m) -> {exe}")
+    log("next runs: systemctl --user list-timers " + UNIT_NAME + ".timer")
+    return 0
+
+
+def cmd_uninstall(args):
+    run(["systemctl", "--user", "disable", "--now", f"{UNIT_NAME}.timer"])
+    unit_dir = HOME / ".config" / "systemd" / "user"
+    for suffix in (".service", ".timer"):
+        (unit_dir / f"{UNIT_NAME}{suffix}").unlink(missing_ok=True)
+    run(["systemctl", "--user", "daemon-reload"])
+    log("removed the timer")
+    return 0
+
+
+def main():
+    global VERBOSE
+    p = argparse.ArgumentParser(
+        prog="claude-idle-compact", description=__doc__.splitlines()[0])
+    p.add_argument("-v", "--verbose", action="store_true")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("status", help="what is live, idle, and eligible")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("run", help="one pass over every eligible session")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("watch", help="run passes forever (for a daemon)")
+    s.add_argument("--interval", type=int, default=300)
+    s.set_defaults(func=cmd_watch)
+
+    s = sub.add_parser("compact", help="compact one session now")
+    s.add_argument("selector", help="job id, session id, pid, or name")
+    s.add_argument("--force", action="store_true",
+                   help="skip the idle/size checks")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_compact)
+
+    s = sub.add_parser("inspect", help="read-only: what the injector sees")
+    s.add_argument("selector", nargs="?")
+    s.add_argument("--attach", action="store_true",
+                   help="also open a client for background sessions")
+    s.set_defaults(func=cmd_inspect)
+
+    s = sub.add_parser("config", help="show or change settings")
+    s.add_argument("--set", action="append", metavar="KEY=VALUE")
+    s.set_defaults(func=cmd_config)
+
+    s = sub.add_parser("install", help="install the systemd user timer")
+    s.add_argument("--interval", type=int, default=5,
+                   help="minutes between checks (default 5)")
+    s.set_defaults(func=cmd_install)
+
+    s = sub.add_parser("uninstall", help="remove the systemd user timer")
+    s.set_defaults(func=cmd_uninstall)
+
+    args = p.parse_args()
+    VERBOSE = args.verbose
+    if not getattr(args, "func", None):
+        p.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
