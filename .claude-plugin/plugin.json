@@ -3,7 +3,7 @@
   "description": "Compacts Claude Code sessions that have sat idle too long. Claude Code's built-in auto-compact fires on how full the context is; this fires on how long a session has been untouched — after 45 minutes idle it types a real /compact into the session, so you come back to one that has already tidied itself instead of one that stalls the moment you type. Works on desktop-app and background sessions via `claude attach`, and on terminal sessions via tmux, yakuake, or Konsole.",
   "version": "0.1.0",
   "author": {
-    "name": "NOV LLC",
+    "name": "GRAV LLC",
     "url": "https://github.com/softwaresoftware-dev"
   },
   "repository": "https://github.com/softwaresoftware-dev/idle-compact",
